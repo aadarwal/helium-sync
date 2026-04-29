@@ -18,42 +18,38 @@ Two devices, one user, sequential. Last push wins.
 ## install
 
 ```bash
-brew install leveldb protobuf
+brew install aadarwal/tap/helium-sync
+helium-sync setup
+```
+
+`setup` is interactive. It asks where to put your private data repo (default `~/helium-data`), walks through adding a git remote (or skips it on the first device), writes `~/.config/helium-sync/config.toml`, and bootstraps from your live Helium state.
+
+On a second device, run the same two commands. `setup` detects the existing remote, branches automatically into the adopt flow, and prompts `y/N` before overwriting local state.
+
+### from source
+
+If you'd rather not use brew (e.g. contributing):
+
+```bash
+brew install leveldb protobuf go
 git clone https://github.com/aadarwal/helium-sync ~/.local/share/helium-sync
 cd ~/.local/share/helium-sync
 python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ln -sf "$PWD/bin/helium-sync" /opt/homebrew/bin/helium-sync
+helium-sync setup
 ```
-
-Bookmarks live in **your** private data repo, separate from this code:
-
-```bash
-mkdir ~/helium-data && cd ~/helium-data && git init
-git remote add origin git@github.com:<you>/helium-data.git
-
-mkdir -p ~/.config/helium-sync
-echo "repo = \"$HOME/helium-data\"" > ~/.config/helium-sync/config.toml
-```
-
-First time on each device:
-
-```bash
-helium-sync init     # device whose bookmarks you want to keep (run once)
-helium-sync adopt    # every other device (replaces local state)
-```
-
-No Go installed? Grab the prebuilt `leveldb-writer` for your arch from [releases](https://github.com/aadarwal/helium-sync/releases).
 
 ## commands
 
 ```
+helium-sync setup     interactive first-time configuration
 helium-sync push      snapshot live → git push     (Helium can stay running)
 helium-sync pull      git pull → write to live     (Helium must be quit; Cmd-Q first)
 helium-sync status    diff live vs canonical
 helium-sync log       recent sync commits
 helium-sync gc        prune logs/ backups older than 30 days
-helium-sync init      first-time bootstrap on the source-of-truth device
-helium-sync adopt     first-time bootstrap on a new device
+helium-sync init      lower-level: bootstrap on the source-of-truth device
+helium-sync adopt     lower-level: bootstrap on a new device receiving canonical
 ```
 
 Discipline: pull at start of session, push at end. Backups under `logs/prePull.<ts>/` if you slip.
