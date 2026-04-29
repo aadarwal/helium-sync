@@ -1,0 +1,13 @@
+# Runtime dependencies. Install into a venv:
+#   python3.13 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#
+# System prerequisites (one-time per machine):
+#   brew install leveldb protobuf
+#
+# leveldb provides the `leveldbutil` CLI used to read Helium's saved-tab-group
+# storage without contending for the LevelDB lock. protobuf provides the
+# `protoc` compiler for regenerating bin/targets/_proto/*.pb2.py from
+# proto/*.proto via proto/compile.sh.
+
+protobuf>=4.21

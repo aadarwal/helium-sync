@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""helium-sync — keep Helium bookmarks and saved tab groups in sync between two
+macOS devices via a private GitHub repo. Modeled on git push/pull.
+
+Usage:
+  helium-sync status       Show what's going on (read-only)
+  helium-sync push         Snapshot this device → repo → origin
+                           (Helium can stay running)
+  helium-sync pull         origin → repo → this device's live profile
+                           (REQUIRES Helium to be quit)
+  helium-sync init         First-time: declare this device the source of truth
+  helium-sync adopt        First-time on a new device: receive canonical state
+
+The mental model is git: pull at the start of a session, push at the end. If
+you forget, the un-pushed device's changes are lost on the next pull. Every
+modification writes a timestamped backup under logs/.
+"""
+
+# ──────────────────────────────────────────────────────────────────────────
+# Auto-relaunch under the repo's .venv so third-party deps (protobuf) resolve
+# regardless of which python is on PATH. Stdlib-only above this block.
+# ──────────────────────────────────────────────────────────────────────────
+import os
+import sys
+from pathlib import Path
+
+_self = Path(__file__).resolve()
+_repo = _self.parent.parent
+_venv_py = _repo / ".venv" / "bin" / "python3"
+
+if _venv_py.exists() and Path(sys.executable).resolve() != _venv_py.resolve():
+    os.execv(str(_venv_py), [str(_venv_py), str(_self), *sys.argv[1:]])
+
+# ──────────────────────────────────────────────────────────────────────────
+# Now under .venv (or the user accepted system python). Imports below may
+# pull in third-party packages.
+# ──────────────────────────────────────────────────────────────────────────
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import tomllib
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, str(_self.parent))
+from targets import ALL_TARGETS  # noqa: E402
+
+# Code paths are anchored to where this script lives — never overridable.
+# These hold the Python target modules, the Go binary, vendored protos.
+SCRIPT_DIR = _self.parent
+
+# Data paths default to the script's parent dir for backward compat with
+# the original "code and data in the same repo" layout. Resolved at runtime
+# in main() based on flag → env var → config file → default.
+DEFAULT_REPO = _self.parent.parent
+DEFAULT_CONFIG = Path("~/.config/helium-sync/config.toml").expanduser()
+DEFAULT_PROFILE = Path.home() / "Library/Application Support/net.imput.helium"
+
+# Resolved at runtime — bound by main() before any cmd_* runs.
+REPO_ROOT: Path = DEFAULT_REPO
+STATE_DIR: Path = REPO_ROOT / "state"
+LOGS_DIR: Path = REPO_ROOT / "logs"
+
+
+def _resolve_repo(cli_arg: Path | None, env: dict, config_path: Path) -> Path:
+    """Choose the data-repo directory by precedence:
+       1. --repo flag (cli_arg)
+       2. HELIUM_SYNC_REPO env var
+       3. `repo = "..."` in config_path (TOML)
+       4. DEFAULT_REPO (backward compat: parent of this script)
+
+    Pure function — pass dependencies explicitly so tests can simulate any
+    combination without polluting the real environment.
+    """
+    if cli_arg is not None:
+        return Path(cli_arg).expanduser().resolve()
+    env_val = env.get("HELIUM_SYNC_REPO")
+    if env_val:
+        return Path(env_val).expanduser().resolve()
+    if config_path.is_file():
+        try:
+            cfg = tomllib.loads(config_path.read_text())
+            cfg_repo = cfg.get("repo")
+            if cfg_repo:
+                return Path(cfg_repo).expanduser().resolve()
+        except (tomllib.TOMLDecodeError, OSError):
+            pass
+    return DEFAULT_REPO.resolve()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────
+
+def hostname() -> str:
+    return subprocess.run(
+        ["scutil", "--get", "LocalHostName"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def helium_running() -> bool:
+    return bool(subprocess.run(
+        ["pgrep", "-i", "helium"],
+        capture_output=True, text=True,
+    ).stdout.strip())
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def run_git(args: list, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(REPO_ROOT), *args],
+        capture_output=True, text=True, check=check,
+    )
+
+
+def log(msg: str) -> None:
+    line = f"{now_iso()} {msg}"
+    print(line)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOGS_DIR / "sync.log", "a") as f:
+        f.write(line + "\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Commands
+# ──────────────────────────────────────────────────────────────────────────
+
+def cmd_status(args) -> int:
+    print(f"Repo:    {REPO_ROOT}")
+    print(f"Profile: {args.profile}")
+    print(f"Host:    {hostname()}")
+    print(f"Helium running here: {'yes' if helium_running() else 'no'}")
+    print()
+
+    print("Recent commits:")
+    out = run_git(["log", "--oneline", "--decorate", "-5"], check=False).stdout
+    for line in (out.strip() or "(none)").splitlines():
+        print(f"  {line}")
+
+    # Are we ahead / behind origin?
+    try:
+        ahead_behind = run_git(
+            ["rev-list", "--left-right", "--count", "HEAD...@{u}"],
+            check=False,
+        ).stdout.strip()
+        if ahead_behind and not ahead_behind.startswith("fatal"):
+            ahead, behind = ahead_behind.split()
+            if int(ahead) or int(behind):
+                print(f"  (ahead {ahead}, behind {behind} vs origin)")
+    except Exception:
+        pass
+    print()
+
+    print("Per target:")
+    for target in ALL_TARGETS:
+        state_file = STATE_DIR / target.state_filename
+        try:
+            live = target.extract(args.profile)
+        except Exception as e:
+            print(f"  {target.name:<18} extract failed: {e}")
+            continue
+
+        live_summary = _summary(target, live)
+
+        if not state_file.exists():
+            print(f"  {target.name:<18} live={live_summary}; canonical=(absent — run `helium-sync init`)")
+            continue
+
+        canonical = target.deserialize(state_file.read_text())
+
+        if target.semantically_equal(live, canonical):
+            print(f"  {target.name:<18} ✓ {live_summary}  (in sync)")
+        else:
+            canon_summary = _summary(target, canonical)
+            diff = _format_diff(target, live, canonical)
+            print(f"  {target.name:<18} live={live_summary} | canonical={canon_summary} | {diff}")
+
+    return 0
+
+
+def _summary(target, data) -> str:
+    """One-line summary of a target's data, target-specific."""
+    if target.name == "bookmarks":
+        n_urls = sum(1 for _ in _walk_urls(data))
+        return f"{n_urls} URLs"
+    if target.name == "saved_tab_groups":
+        return f"{len(data.get('groups', {}))} groups, {len(data.get('tabs', {}))} tabs"
+    return "?"
+
+
+def _counts(target, data) -> list[tuple[str, int]]:
+    """Pairs of (label, count) for diff arithmetic between two states."""
+    if target.name == "bookmarks":
+        return [("URLs", sum(1 for _ in _walk_urls(data)))]
+    if target.name == "saved_tab_groups":
+        return [
+            ("groups", len(data.get("groups", {}))),
+            ("tabs",   len(data.get("tabs", {}))),
+        ]
+    return []
+
+
+def _format_diff(target, live, canonical) -> str:
+    """Render the live-vs-canonical delta as e.g. '+2 groups, +44 tabs'."""
+    parts = []
+    for (label, n_l), (_, n_c) in zip(_counts(target, live), _counts(target, canonical)):
+        delta = n_l - n_c
+        if delta != 0:
+            parts.append(f"{delta:+d} {label}")
+    return ", ".join(parts) if parts else "differs (push to propagate)"
+
+
+def _walk_urls(tree):
+    for root in tree.get("roots", {}).values():
+        yield from _walk_urls_rec(root)
+
+
+def _walk_urls_rec(node):
+    for c in node.get("children") or []:
+        if c.get("type") == "url":
+            yield c
+        elif c.get("type") == "folder":
+            yield from _walk_urls_rec(c)
+
+
+def cmd_push(args) -> int:
+    log(f"=== push from {hostname()} ===")
+
+    log("git pull --rebase…")
+    try:
+        run_git(["pull", "--rebase", "--quiet"])
+    except subprocess.CalledProcessError as e:
+        log(f"git pull failed: {(e.stderr or '').strip()}")
+        return 1
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    any_change = False
+    for target in ALL_TARGETS:
+        log(f"  extract {target.name}…")
+        try:
+            data = target.extract(args.profile)
+        except Exception as e:
+            log(f"  extract {target.name} failed: {e}")
+            return 2
+
+        state_file = STATE_DIR / target.state_filename
+        text = target.serialize(data)
+        prev = state_file.read_text() if state_file.exists() else None
+        if text != prev:
+            state_file.write_text(text)
+            any_change = True
+            log(f"  {target.name}: wrote {len(text)} bytes ({_summary(target, data)})")
+        else:
+            log(f"  {target.name}: unchanged")
+
+    if not any_change:
+        log("no changes to push")
+        return 0
+
+    run_git(["add", "state/"])
+    diff = run_git(["diff", "--staged", "--quiet"], check=False)
+    if diff.returncode == 0:
+        log("nothing actually staged after add")
+        return 0
+
+    msg = f"push from {hostname()} {now_iso()}"
+    run_git(["commit", "-q", "-m", msg])
+    log(f"committed: {msg}")
+
+    log("git push…")
+    try:
+        run_git(["push", "--quiet"])
+        log("pushed to origin")
+        return 0
+    except subprocess.CalledProcessError as e:
+        log(f"push rejected: {(e.stderr or '').strip()}")
+        log("retrying with pull --rebase…")
+        try:
+            run_git(["pull", "--rebase", "--quiet"])
+            run_git(["push", "--quiet"])
+            log("pushed on retry")
+            return 0
+        except subprocess.CalledProcessError as e2:
+            log(f"retry failed: {(e2.stderr or '').strip()}")
+            log("manual intervention needed: `git pull --rebase` then `git push`")
+            return 3
+
+
+def cmd_pull(args) -> int:
+    log(f"=== pull on {hostname()} ===")
+
+    if not args.allow_helium_running and helium_running():
+        print("ERROR: Helium is running on this device.")
+        print("Pull writes directly to your Helium profile; quit Helium (Cmd-Q) first.")
+        print("(Or, for the brave/testing: --allow-helium-running)")
+        return 4
+
+    log("git pull --rebase…")
+    try:
+        run_git(["pull", "--rebase", "--quiet"])
+    except subprocess.CalledProcessError as e:
+        log(f"git pull failed: {(e.stderr or '').strip()}")
+        return 1
+
+    backup_root = LOGS_DIR / f"prePull.{now_stamp()}"
+    backup_root.mkdir(parents=True, exist_ok=True)
+
+    n_applied = 0
+    for target in ALL_TARGETS:
+        state_file = STATE_DIR / target.state_filename
+        if not state_file.exists():
+            log(f"  {target.name}: no canonical state in repo — skipping (run init on the source device)")
+            continue
+
+        log(f"  apply {target.name}…")
+        try:
+            data = target.deserialize(state_file.read_text())
+            target.apply(args.profile, data, backup_root)
+        except Exception as e:
+            log(f"  apply {target.name} failed: {e}")
+            return 5
+        log(f"  {target.name}: applied ({_summary(target, data)})")
+        n_applied += 1
+
+    log(f"backup: {backup_root.relative_to(REPO_ROOT)}")
+    log(f"done. {n_applied} target(s) applied. Launch Helium to see the synced state.")
+    return 0
+
+
+def cmd_init(args) -> int:
+    canonical_exists = any((STATE_DIR / t.state_filename).exists() for t in ALL_TARGETS)
+    if canonical_exists and not args.force:
+        print(f"ERROR: canonical state already exists in {STATE_DIR.relative_to(REPO_ROOT)}/")
+        print("If you really want to overwrite it, pass --force.")
+        return 6
+    return cmd_push(args)
+
+
+def cmd_log(args) -> int:
+    fmt = "%C(yellow)%h%C(reset)  %C(cyan)%ad%C(reset)  %s"
+    color = "always" if sys.stdout.isatty() else "never"
+    out = run_git(
+        ["log", f"--max-count={args.n}", f"--pretty=format:{fmt}",
+         "--date=format:%Y-%m-%d %H:%M", f"--color={color}"],
+        check=False,
+    ).stdout
+    if not out.strip():
+        print("(no commits)")
+        return 0
+    print(out)
+    return 0
+
+
+_BACKUP_PATTERN = re.compile(r"^(prePull|preSync)\.(\d{8}-\d{6})$")
+
+
+def cmd_gc(args) -> int:
+    if not LOGS_DIR.exists():
+        print("no logs/ directory yet — nothing to gc")
+        return 0
+
+    cutoff = datetime.now() - timedelta(days=args.keep_days)
+
+    matched = []
+    for entry in LOGS_DIR.iterdir():
+        if not entry.is_dir():
+            continue
+        m = _BACKUP_PATTERN.match(entry.name)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(2), "%Y%m%d-%H%M%S")
+        except ValueError:
+            continue
+        if ts < cutoff:
+            size = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+            matched.append((entry, ts, size))
+
+    if not matched:
+        print(f"no backups older than {args.keep_days} day(s) — nothing to prune")
+        return 0
+
+    matched.sort(key=lambda t: t[1])
+    total = 0
+    print(f"backups older than {args.keep_days} day(s):")
+    for entry, ts, size in matched:
+        print(f"  {entry.name:<32} {ts:%Y-%m-%d %H:%M}  {size//1024:>6} KB")
+        total += size
+    print(f"  {'total':<32} {' ':<16}  {total//1024:>6} KB")
+
+    if args.dry_run:
+        print("(dry run — pass without --dry-run to actually delete)")
+        return 0
+
+    for entry, _, _ in matched:
+        shutil.rmtree(entry)
+    print(f"deleted {len(matched)} backup directories ({total//1024} KB)")
+    return 0
+
+
+def cmd_adopt(args) -> int:
+    print("This will REPLACE your local Helium bookmarks and saved tab groups")
+    print("with the canonical state from the repo.")
+    print("Backups go to logs/prePull.<timestamp>/.")
+    print()
+    if not args.yes:
+        try:
+            answer = input("Continue? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer != "y":
+            print("aborted")
+            return 7
+    # adopt is just a confirmed pull
+    args.allow_helium_running = False
+    return cmd_pull(args)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--profile", type=Path, default=DEFAULT_PROFILE,
+                        help="Helium profile directory")
+    parser.add_argument("--repo", type=Path, default=None,
+                        help="data repo path (default: $HELIUM_SYNC_REPO, "
+                             "or `repo` in ~/.config/helium-sync/config.toml, "
+                             "or the parent of this script)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="show what's going on (read-only)")
+
+    sub.add_parser("push", help="snapshot → repo → origin")
+
+    p_pull = sub.add_parser("pull", help="origin → repo → live profile")
+    p_pull.add_argument("--allow-helium-running", action="store_true",
+                        help="DANGEROUS — bypass the running-browser guard")
+
+    p_init = sub.add_parser("init", help="first-time: this device is the truth")
+    p_init.add_argument("--force", action="store_true",
+                        help="overwrite existing canonical state")
+
+    p_adopt = sub.add_parser("adopt", help="first-time on a new device")
+    p_adopt.add_argument("--yes", "-y", action="store_true",
+                         help="skip confirmation prompt")
+    p_adopt.add_argument("--allow-helium-running", action="store_true",
+                         help="DANGEROUS — bypass the running-browser guard")
+
+    p_gc = sub.add_parser("gc", help="prune old backups in logs/")
+    p_gc.add_argument("--keep-days", type=int, default=30,
+                      help="prune backups older than this many days (default: 30)")
+    p_gc.add_argument("--dry-run", action="store_true",
+                      help="show what would be deleted without deleting")
+
+    p_log = sub.add_parser("log", help="show recent sync history")
+    p_log.add_argument("-n", type=int, default=10,
+                       help="number of commits to show (default: 10)")
+
+    args = parser.parse_args()
+
+    # Bind the data-repo paths once per invocation so cmd_* functions can
+    # use the module-level globals as before.
+    global REPO_ROOT, STATE_DIR, LOGS_DIR
+    REPO_ROOT = _resolve_repo(args.repo, os.environ, DEFAULT_CONFIG)
+    STATE_DIR = REPO_ROOT / "state"
+    LOGS_DIR = REPO_ROOT / "logs"
+
+    handler = {
+        "status": cmd_status,
+        "push": cmd_push,
+        "pull": cmd_pull,
+        "init": cmd_init,
+        "adopt": cmd_adopt,
+        "gc": cmd_gc,
+        "log": cmd_log,
+    }[args.cmd]
+    return handler(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

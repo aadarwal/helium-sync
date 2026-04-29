@@ -1,0 +1,10 @@
+# User data — never commit to the public code repo. Users keep state in
+# their own private data repo (see README "Code vs. data" section).
+state/
+logs/
+
+# Build / venv / cache artifacts
+*.pyc
+__pycache__/
+.DS_Store
+.venv/

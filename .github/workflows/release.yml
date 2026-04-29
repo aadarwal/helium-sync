@@ -1,0 +1,50 @@
+name: release
+
+# Triggered when a `v*` tag is pushed (e.g., `v0.1.0`).
+# Cross-compiles `leveldb-writer` for macOS arm64 and amd64, attaches the
+# binaries to a GitHub Release. Users without Go installed can download
+# the prebuilt binary for their arch instead of running bin/_go/build.sh.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # create / update the release
+
+jobs:
+  release:
+    name: build binaries + publish release
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: cross-compile for darwin/arm64 and darwin/amd64
+        run: |
+          mkdir -p dist
+          cd bin/_go/leveldb_writer
+          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" \
+              -o ../../../dist/leveldb-writer-darwin-arm64 .
+          GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
+              -o ../../../dist/leveldb-writer-darwin-amd64 .
+
+      - name: verify architecture of each artifact
+        run: |
+          set -e
+          file dist/leveldb-writer-darwin-arm64 | grep -q "Mach-O 64-bit executable arm64"
+          file dist/leveldb-writer-darwin-amd64 | grep -q "Mach-O 64-bit executable x86_64"
+          ls -la dist/
+
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/leveldb-writer-darwin-arm64
+            dist/leveldb-writer-darwin-amd64
+          generate_release_notes: true
+          fail_on_unmatched_files: true

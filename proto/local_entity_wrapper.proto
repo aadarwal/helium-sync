@@ -1,0 +1,22 @@
+// Local-only wrapper observed in Chromium's sync engine local model store.
+// Each value stored under `<datatype>-dt-<UUID>` keys in the Sync Data LevelDB
+// is wrapped in this envelope:
+//
+//   field 1 (varint): observed value 1 — assumed marker indicating a present
+//                     entity (vs. tombstone/metadata)
+//   field 2 (bytes) : the serialized type-specific specifics, e.g. a
+//                     SavedTabGroupSpecifics for saved_tab_group-dt-* keys
+//
+// Not part of upstream Chromium's public proto schema; reconstructed from
+// observation. Field numbers chosen to match what's on the wire.
+
+syntax = "proto2";
+
+package helium_sync;
+
+option optimize_for = LITE_RUNTIME;
+
+message LocalEntityWrapper {
+  optional int32 marker = 1;
+  optional bytes specifics = 2;
+}

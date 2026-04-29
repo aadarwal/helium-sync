@@ -1,0 +1,81 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────
+  # Linux: pure-Python tests. Real-data and apply tests skip themselves
+  # since there's no Helium profile here. Linux is the cheap, fast lane —
+  # most regressions are caught here.
+  # ──────────────────────────────────────────────────────────────────────
+  unit-linux:
+    name: unit tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: install python deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: run tests
+        run: .venv/bin/python -m unittest discover tests/ -v
+
+  # ──────────────────────────────────────────────────────────────────────
+  # macOS arm64: same Python tests, PLUS verify the Go binary builds. The
+  # committed binary in bin/leveldb-writer is arm64-Mac; this job confirms
+  # bin/_go/build.sh produces a working binary on a clean runner.
+  # ──────────────────────────────────────────────────────────────────────
+  macos:
+    name: build leveldb-writer + tests (macOS arm64)
+    runs-on: macos-14
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: install system libs
+        run: brew install leveldb protobuf
+
+      - name: install python deps
+        run: |
+          python3.13 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: build leveldb-writer (verify build.sh works on a clean runner)
+        run: |
+          # Build to a tmp location so we don't overwrite the committed binary
+          mkdir -p /tmp/built
+          (cd bin/_go/leveldb_writer && go build -trimpath -ldflags="-s -w" -o /tmp/built/leveldb-writer .)
+          file /tmp/built/leveldb-writer
+          /tmp/built/leveldb-writer 2>&1 | head -1 || true   # prints usage; exits 1, that's fine
+
+      - name: confirm committed binary is also valid arm64-Mac
+        run: |
+          file bin/leveldb-writer
+          file bin/leveldb-writer | grep -q "Mach-O 64-bit executable arm64"
+
+      - name: run tests
+        run: .venv/bin/python -m unittest discover tests/ -v

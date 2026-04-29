@@ -1,0 +1,2 @@
+bin/leveldb-writer binary
+bin/targets/_proto/*.py linguist-generated=true
