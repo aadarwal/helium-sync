@@ -122,6 +122,14 @@ def run_git(args: list, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
+def _has_upstream() -> bool:
+    """True if the current branch has an upstream tracking branch
+    configured. False if the repo has no remote, or no main yet, or
+    main has no upstream set."""
+    r = run_git(["rev-parse", "--abbrev-ref", "@{upstream}"], check=False)
+    return r.returncode == 0
+
+
 def log(msg: str) -> None:
     line = f"{now_iso()} {msg}"
     print(line)
@@ -133,6 +141,132 @@ def log(msg: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 # Commands
 # ──────────────────────────────────────────────────────────────────────────
+
+def cmd_setup(args) -> int:
+    """Interactive first-time setup. Replaces the manual `git init + write
+    config.toml + helium-sync init/adopt` dance with a guided walkthrough.
+
+    Branches automatically:
+      - empty remote URL  → init flow (this device is the source of truth)
+      - URL pointing at an empty repo  → init flow
+      - URL pointing at a repo with existing main → adopt flow
+    """
+    if DEFAULT_CONFIG.exists() and not args.force:
+        try:
+            current_repo = tomllib.loads(DEFAULT_CONFIG.read_text()).get("repo", "(unparseable)")
+        except tomllib.TOMLDecodeError:
+            current_repo = "(unparseable)"
+        print(f"Already configured: {DEFAULT_CONFIG}")
+        print(f"  data repo: {current_repo}")
+        print()
+        print("Pass --force to reconfigure (existing config will be overwritten).")
+        return 8
+
+    print("helium-sync needs a private git repo to store your bookmarks and tab groups.")
+    print()
+
+    # Where to put the data repo
+    default_repo = Path.home() / "helium-data"
+    repo_input = _ask(f"Where should it live? [{default_repo}]: ", default=str(default_repo))
+    repo_path = Path(repo_input).expanduser().resolve()
+    if repo_path.exists() and any(repo_path.iterdir()) and not (repo_path / ".git").exists():
+        print(f"  ✗ {repo_path} exists and isn't empty / isn't a git repo. Pick a different path.")
+        return 8
+    repo_path.mkdir(parents=True, exist_ok=True)
+    print(f"  ✓ {repo_path}")
+
+    # git init (or reuse existing)
+    if not (repo_path / ".git").exists():
+        subprocess.run(["git", "-C", str(repo_path), "init", "-q", "-b", "main"], check=True)
+        print("  ✓ initialized git repo")
+
+    # Remote URL (optional)
+    print()
+    print("Already have a helium-data remote (e.g. from another device)? Enter its URL.")
+    print("Leave empty if this is your first device.")
+    remote_url = _ask("Remote URL: ", default="").strip()
+
+    is_adopt = False
+    if remote_url:
+        # Wire up origin
+        existing = subprocess.run(
+            ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
+            capture_output=True, text=True,
+        )
+        if existing.returncode == 0:
+            subprocess.run(["git", "-C", str(repo_path), "remote", "set-url", "origin", remote_url], check=True)
+        else:
+            subprocess.run(["git", "-C", str(repo_path), "remote", "add", "origin", remote_url], check=True)
+        print(f"  ✓ origin → {remote_url}")
+
+        # Does the remote already have a main with canonical state?
+        ls_remote = subprocess.run(
+            ["git", "-C", str(repo_path), "ls-remote", "origin", "main"],
+            capture_output=True, text=True,
+        )
+        if ls_remote.stdout.strip():
+            is_adopt = True
+            print("  ✓ remote has existing canonical state — this is an ADOPT situation")
+            subprocess.run(
+                ["git", "-C", str(repo_path), "fetch", "origin", "main", "--quiet"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_path), "checkout", "-q", "-B", "main", "origin/main"],
+                check=True,
+            )
+        else:
+            print("  ✓ remote is empty — first-device flow")
+
+    # Write config.toml
+    DEFAULT_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_CONFIG.write_text(f'repo = "{repo_path}"\n')
+    print(f"  ✓ {DEFAULT_CONFIG}")
+
+    # Re-bind path globals so init/adopt operate on the new repo
+    global REPO_ROOT, STATE_DIR, LOGS_DIR
+    REPO_ROOT = repo_path
+    STATE_DIR = repo_path / "state"
+    LOGS_DIR = repo_path / "logs"
+
+    print()
+    if is_adopt:
+        print("Next: ADOPT — this will REPLACE your local Helium state with the canonical")
+        print("from the remote. Backups go to logs/prePull.<timestamp>/.")
+        if helium_running():
+            print()
+            print("⚠️  Helium is running. Quit it (Cmd-Q) first, then run:")
+            print("    helium-sync adopt")
+            return 0
+        if not args.yes and _ask("Continue? [y/N]: ", default="n").lower() != "y":
+            print("aborted. When you're ready, run: helium-sync adopt")
+            return 0
+        return cmd_pull(args)
+    else:
+        print("Next: extract your current Helium state and push to canonical.")
+        if not args.yes and _ask("Continue? [Y/n]: ", default="y").lower() not in ("y", ""):
+            print("aborted. When you're ready, run: helium-sync init")
+            return 0
+        rc = cmd_push(args)
+        if rc == 0:
+            print()
+            print("Done. On other devices: install helium-sync, run `helium-sync setup` and")
+            print(f"give it the remote URL pointing at this data repo.")
+        return rc
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    """input() with a default. Returns the default in non-interactive mode
+    (so calling setup with stdin redirected falls back to defaults rather
+    than crashing)."""
+    if not sys.stdin.isatty():
+        return default
+    try:
+        answer = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    return answer or default
+
 
 def cmd_status(args) -> int:
     print(f"Repo:    {REPO_ROOT}")
@@ -235,12 +369,17 @@ def _walk_urls_rec(node):
 def cmd_push(args) -> int:
     log(f"=== push from {hostname()} ===")
 
-    log("git pull --rebase…")
-    try:
-        run_git(["pull", "--rebase", "--quiet"])
-    except subprocess.CalledProcessError as e:
-        log(f"git pull failed: {(e.stderr or '').strip()}")
-        return 1
+    has_upstream = _has_upstream()
+
+    if has_upstream:
+        log("git pull --rebase…")
+        try:
+            run_git(["pull", "--rebase", "--quiet"])
+        except subprocess.CalledProcessError as e:
+            log(f"git pull failed: {(e.stderr or '').strip()}")
+            return 1
+    else:
+        log("(no upstream configured — skipping git pull)")
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     any_change = False
@@ -275,6 +414,11 @@ def cmd_push(args) -> int:
     msg = f"push from {hostname()} {now_iso()}"
     run_git(["commit", "-q", "-m", msg])
     log(f"committed: {msg}")
+
+    if not has_upstream:
+        log("(no upstream configured — local commit only; "
+            "add a remote later with: git -C <repo> remote add origin <url>)")
+        return 0
 
     log("git push…")
     try:
@@ -442,6 +586,12 @@ def main() -> int:
                              "or the parent of this script)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p_setup = sub.add_parser("setup", help="interactive first-time configuration")
+    p_setup.add_argument("--force", action="store_true",
+                         help="overwrite existing config")
+    p_setup.add_argument("--yes", "-y", action="store_true",
+                         help="skip confirmation prompts (use defaults)")
+
     sub.add_parser("status", help="show what's going on (read-only)")
 
     sub.add_parser("push", help="snapshot → repo → origin")
@@ -480,6 +630,7 @@ def main() -> int:
     LOGS_DIR = REPO_ROOT / "logs"
 
     handler = {
+        "setup": cmd_setup,
         "status": cmd_status,
         "push": cmd_push,
         "pull": cmd_pull,

@@ -113,5 +113,18 @@ class TestResolveRepo(unittest.TestCase):
         self.assertEqual(got, self.cli.DEFAULT_REPO.resolve())
 
 
+class TestAsk(unittest.TestCase):
+    """_ask fallback behavior — used by `helium-sync setup` so scripted runs
+    (CI, --yes, piped input) fall through to defaults instead of blocking
+    on an unanswerable prompt."""
+
+    def test_returns_default_when_stdin_not_a_tty(self):
+        cli = _import_cli()
+        # In test runs, stdin is typically piped (not a TTY); _ask returns
+        # the default without prompting.
+        self.assertEqual(cli._ask("prompt: ", default="hello"), "hello")
+        self.assertEqual(cli._ask("prompt: ", default=""), "")
+
+
 if __name__ == "__main__":
     unittest.main()
