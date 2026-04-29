@@ -10,4 +10,4 @@
 # `protoc` compiler for regenerating bin/targets/_proto/*.pb2.py from
 # proto/*.proto via proto/compile.sh.
 
-protobuf>=4.21
+protobuf>=7.34.1
