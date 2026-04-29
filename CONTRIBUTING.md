@@ -61,6 +61,30 @@ Use the issue template — Helium version, macOS arch, and the output of
 the failing command are what I'll need first. Run the failing command
 with `--verbose` (where supported) and paste the relevant lines.
 
+## Releasing
+
+1. Tag from main: `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`
+2. `release.yml` auto-builds `leveldb-writer-darwin-{arm64,amd64}` and
+   publishes a GitHub Release with both attached.
+3. `bump-tap.yml` listens for the publish event, recomputes the three
+   sha256s (source tarball + arm64 + amd64 binaries), and opens a PR on
+   `aadarwal/homebrew-tap` that bumps the formula. Review and merge it;
+   `brew install aadarwal/tap/helium-sync` then resolves to the new tag.
+
+`bump-tap.yml` requires a `TAP_TOKEN` secret — fine-grained PAT with
+`Contents: read+write` and `Pull requests: read+write` scoped only to
+`aadarwal/homebrew-tap`. Set it up once:
+
+```bash
+# https://github.com/settings/personal-access-tokens (fine-grained)
+# Repository access → Only aadarwal/homebrew-tap
+# Permissions      → Contents r/w, Pull requests r/w
+gh secret set TAP_TOKEN --repo aadarwal/helium-sync --body <paste-token>
+```
+
+Without the secret the workflow fails loudly and you'd update the
+formula manually instead.
+
 ## Architecture pointers
 
 - `bin/helium-sync` — CLI entry point. Auto-relaunches under `.venv`.

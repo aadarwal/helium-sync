@@ -1,0 +1,36 @@
+version: 2
+updates:
+  # Python deps in requirements.txt — we have one (protobuf).
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+
+  # GitHub Actions versions in .github/workflows/.
+  # The release workflow currently uses Node-20 actions; this picks up the
+  # Node-24 successors when they ship.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "ci"
+
+  # Go modules under bin/_go/leveldb_writer/.
+  # We depend on syndtr/goleveldb (LevelDB write path) and indirectly on
+  # golang/snappy. Updates here are rare but worth tracking.
+  - package-ecosystem: "gomod"
+    directory: "/bin/_go/leveldb_writer"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "go"

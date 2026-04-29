@@ -1,0 +1,148 @@
+name: bump-tap
+
+# Triggered when a GitHub Release is published (i.e. after the `release.yml`
+# workflow finishes building the prebuilt binaries on a `v*` tag push).
+#
+# Computes the new sha256 of the release tarball + arm64 + amd64 binaries,
+# rewrites the formula at aadarwal/homebrew-tap, and opens a PR on that
+# repo. Merging that PR is what makes `brew install aadarwal/tap/helium-sync`
+# pick up the new version.
+#
+# Requires a fine-grained PAT stored as `TAP_TOKEN` secret with:
+#   Repository access: Only aadarwal/homebrew-tap
+#   Permissions:       Contents read+write, Pull requests read+write
+#
+# To set it up the first time:
+#   1. https://github.com/settings/personal-access-tokens (fine-grained)
+#   2. Generate token, scoped only to aadarwal/homebrew-tap, with the
+#      permissions above.
+#   3. Locally, with that token in clipboard:
+#      gh secret set TAP_TOKEN --repo aadarwal/helium-sync --body <paste>
+#   4. Done — next release auto-opens the bump PR.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: open formula bump PR on aadarwal/homebrew-tap
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: compute new SHAs
+        id: shas
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -e
+          REPO="aadarwal/helium-sync"
+
+          src_url="https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz"
+          arm_url="https://github.com/${REPO}/releases/download/${TAG}/leveldb-writer-darwin-arm64"
+          amd_url="https://github.com/${REPO}/releases/download/${TAG}/leveldb-writer-darwin-amd64"
+
+          src_sha=$(curl -fsSL "$src_url" | shasum -a 256 | awk '{print $1}')
+          arm_sha=$(curl -fsSL "$arm_url" | shasum -a 256 | awk '{print $1}')
+          amd_sha=$(curl -fsSL "$amd_url" | shasum -a 256 | awk '{print $1}')
+
+          echo "tag=$TAG"        >> "$GITHUB_OUTPUT"
+          echo "src_sha=$src_sha" >> "$GITHUB_OUTPUT"
+          echo "arm_sha=$arm_sha" >> "$GITHUB_OUTPUT"
+          echo "amd_sha=$amd_sha" >> "$GITHUB_OUTPUT"
+          echo
+          echo "tag:     $TAG"
+          echo "src_sha: $src_sha"
+          echo "arm_sha: $arm_sha"
+          echo "amd_sha: $amd_sha"
+
+      - name: checkout the tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: aadarwal/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: rewrite formula with new tag + SHAs
+        env:
+          TAG:     ${{ steps.shas.outputs.tag }}
+          SRC_SHA: ${{ steps.shas.outputs.src_sha }}
+          ARM_SHA: ${{ steps.shas.outputs.arm_sha }}
+          AMD_SHA: ${{ steps.shas.outputs.amd_sha }}
+        run: |
+          set -e
+          cd tap
+          F=Formula/helium-sync.rb
+
+          # 1. source url + sha (the one referenced by `url`/`sha256` near the top)
+          python3 - "$F" "$TAG" "$SRC_SHA" "$ARM_SHA" "$AMD_SHA" <<'PY'
+          import re, sys
+          path, tag, src_sha, arm_sha, amd_sha = sys.argv[1:6]
+          text = open(path).read()
+          # url + matching sha256 for the source tarball (top of file)
+          text = re.sub(
+              r'url "https://github\.com/aadarwal/helium-sync/archive/refs/tags/v[\d.]+\.tar\.gz"',
+              f'url "https://github.com/aadarwal/helium-sync/archive/refs/tags/{tag}.tar.gz"',
+              text, count=1,
+          )
+          # First sha256 after the source url
+          text = re.sub(
+              r'(url "https://github\.com/aadarwal/helium-sync/archive/refs/tags/[^"]+"\s*\n\s*sha256 ")[a-f0-9]+(")',
+              rf'\g<1>{src_sha}\g<2>',
+              text, count=1,
+          )
+          # arm64 binary url + sha
+          text = re.sub(
+              r'url "https://github\.com/aadarwal/helium-sync/releases/download/v[\d.]+/leveldb-writer-darwin-arm64"',
+              f'url "https://github.com/aadarwal/helium-sync/releases/download/{tag}/leveldb-writer-darwin-arm64"',
+              text, count=1,
+          )
+          text = re.sub(
+              r'(leveldb-writer-darwin-arm64"\s*\n\s*sha256 ")[a-f0-9]+(")',
+              rf'\g<1>{arm_sha}\g<2>',
+              text, count=1,
+          )
+          # amd64 binary url + sha
+          text = re.sub(
+              r'url "https://github\.com/aadarwal/helium-sync/releases/download/v[\d.]+/leveldb-writer-darwin-amd64"',
+              f'url "https://github.com/aadarwal/helium-sync/releases/download/{tag}/leveldb-writer-darwin-amd64"',
+              text, count=1,
+          )
+          text = re.sub(
+              r'(leveldb-writer-darwin-amd64"\s*\n\s*sha256 ")[a-f0-9]+(")',
+              rf'\g<1>{amd_sha}\g<2>',
+              text, count=1,
+          )
+          open(path, "w").write(text)
+          PY
+
+          echo "=== updated formula diff ==="
+          git diff "$F"
+
+      - name: open PR on tap
+        env:
+          TAG: ${{ steps.shas.outputs.tag }}
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          set -e
+          cd tap
+          BRANCH="bump/helium-sync-${TAG}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH"
+          git add Formula/helium-sync.rb
+          git commit -m "helium-sync ${TAG}"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --title "helium-sync ${TAG}" \
+            --body "Auto-generated by helium-sync's bump-tap workflow on release publish.
+
+          Updates source tarball URL, leveldb-writer-darwin-arm64 and -amd64 URLs, plus all three sha256s." \
+            --base main \
+            --head "$BRANCH"
