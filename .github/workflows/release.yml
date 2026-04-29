@@ -41,7 +41,7 @@ jobs:
           ls -la dist/
 
       - name: publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/leveldb-writer-darwin-arm64
