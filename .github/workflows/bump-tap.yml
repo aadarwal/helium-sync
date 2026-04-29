@@ -60,7 +60,7 @@ jobs:
           echo "amd_sha: $amd_sha"
 
       - name: checkout the tap repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: aadarwal/homebrew-tap
           token: ${{ secrets.TAP_TOKEN }}
